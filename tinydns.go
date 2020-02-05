@@ -1,12 +1,20 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
+	"os"
 	"strings"
+	"time"
 
+	"github.com/insomniacslk/dhcp/dhcpv4/nclient4"
 	"github.com/miekg/dns"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // block list
@@ -286,9 +294,198 @@ func (b *naiveBlocker) handler(w dns.ResponseWriter, r *dns.Msg) {
 	}
 }
 
+const (
+	CloudflareIPv4 = "1.1.1.1"
+	CloudflareIPv6 = "2606:4700:4700::1111"
+	ICMPv4         = 1  // https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
+	ICMPv6         = 58 // https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
+	HelloTinyDNS   = "HELLO-TINYDNS"
+)
+
+func ping6(ip net.IP, iface net.Interface) error {
+	conn, err := icmp.ListenPacket("udp6", ip.String())
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	defer conn.Close()
+
+	// https://en.wikipedia.org/wiki/Ping_(networking_utility)#Echo_request
+	msg := icmp.Message{
+		Type: ipv6.ICMPTypeEchoRequest, Code: 0,
+		Body: &icmp.Echo{
+			ID: os.Getpid() & 0xffff, Seq: 1,
+			Data: []byte(HelloTinyDNS),
+		},
+	}
+	writeBuf, err := msg.Marshal(nil)
+	if err != nil {
+		return fmt.Errorf("marshalling: %w", err)
+	}
+	_, err = conn.WriteTo(writeBuf, &net.UDPAddr{IP: net.ParseIP(CloudflareIPv6), Zone: iface.Name})
+	if err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	replyBuf := make([]byte, iface.MTU)
+	n, _, err := conn.ReadFrom(replyBuf)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	replyMessage, err := icmp.ParseMessage(ICMPv6, replyBuf[:n])
+	if err != nil {
+		return fmt.Errorf("parsing: %w", err)
+	}
+	switch replyMessage.Type {
+	case ipv6.ICMPTypeEchoReply:
+		if echo, ok := replyMessage.Body.(*icmp.Echo); ok {
+			if string(echo.Data) != HelloTinyDNS {
+				return fmt.Errorf("got %q; want %q", HelloTinyDNS, string(echo.Data))
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("got %+v; want echo reply", replyMessage)
+	}
+}
+
+func ping4(ip net.IP, iface net.Interface) error {
+	conn, err := icmp.ListenPacket("udp4", ip.String())
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	defer conn.Close()
+
+	// https://en.wikipedia.org/wiki/Ping_(networking_utility)#Echo_request
+	msg := icmp.Message{
+		Type: ipv4.ICMPTypeEcho, Code: 0,
+		Body: &icmp.Echo{
+			ID: os.Getpid() & 0xffff, Seq: 1,
+			Data: []byte(HelloTinyDNS),
+		},
+	}
+	writeBuf, err := msg.Marshal(nil)
+	if err != nil {
+		return fmt.Errorf("marshalling: %w", err)
+	}
+	_, err = conn.WriteTo(writeBuf, &net.UDPAddr{IP: net.ParseIP(CloudflareIPv4), Zone: iface.Name})
+	if err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	replyBuf := make([]byte, iface.MTU)
+	n, _, err := conn.ReadFrom(replyBuf)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	replyMessage, err := icmp.ParseMessage(ICMPv4, replyBuf[:n])
+	if err != nil {
+		return fmt.Errorf("parsing: %w", err)
+	}
+	switch replyMessage.Type {
+	case ipv4.ICMPTypeEchoReply:
+		if echo, ok := replyMessage.Body.(*icmp.Echo); ok {
+			if string(echo.Data) != HelloTinyDNS {
+				return fmt.Errorf("got %q; want %q", HelloTinyDNS, string(echo.Data))
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("got %+v; want echo reply", replyMessage)
+	}
+}
+
+func ping(ip net.IP, iface net.Interface) error {
+	if ip.To4() == nil {
+		return ping6(ip, iface)
+	} else {
+		return ping4(ip, iface)
+	}
+}
+
+func publicInterfaces() ([]net.Interface, error) {
+	m := make(map[string]net.Interface, 0)
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return nil, err
+		}
+		for _, addr := range addrs {
+			ip, _, err := net.ParseCIDR(addr.String())
+			if err != nil {
+				return nil, err
+			}
+			if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+
+			err = ping(ip, iface)
+			if err != nil {
+				return nil, fmt.Errorf("ping: %w", err)
+			}
+
+			m[iface.Name] = iface
+		}
+	}
+
+	pubIfaces := make([]net.Interface, 0, len(m))
+	for _, iface := range m {
+		pubIfaces = append(pubIfaces, iface)
+	}
+	return pubIfaces, nil
+}
+
+func discoverLocalDNS() ([]net.IP, error) {
+	m := make(map[string]net.IP)
+	ifaces, err := publicInterfaces()
+	if err != nil {
+		return nil, fmt.Errorf("public interfaces: %w", err)
+	}
+
+	for _, iface := range ifaces {
+		cl, err := nclient4.New(iface.Name, nclient4.WithTimeout(10*time.Second))
+		if err != nil {
+			return nil, fmt.Errorf("DHCPv4 client: %w", err)
+		}
+		defer func() {
+			err = cl.Close()
+			if err != nil {
+				log.Fatal(err)
+			}
+		}()
+
+		offer, err := cl.DiscoverOffer(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("DHCP discover: %w", err)
+		}
+		for _, ip := range offer.DNS() {
+			m[ip.String()] = ip
+		}
+	}
+	dnsIPs := make([]net.IP, 0, len(m))
+	for _, dnsIP := range m {
+		dnsIPs = append(dnsIPs, dnsIP)
+	}
+	return dnsIPs, nil
+}
+
 func main() {
-	server := dns.Server{Addr: ":10053", Net: "udp"}
-	b, err := NewTreeBlocker("1.1:53", "easylist.txt")
+	dnsIPs, err := discoverLocalDNS()
+	if err != nil {
+		log.Fatal(err)
+	}
+	upstreamIP := dnsIPs[0].String()
+	log.Printf("starting to listen on :53, upstream is %q", upstreamIP)
+	server := dns.Server{Addr: ":53", Net: "udp"}
+	b, err := NewTreeBlocker(upstreamIP+":53", "easylist.txt")
 	if err != nil {
 		log.Fatal(err)
 	}
